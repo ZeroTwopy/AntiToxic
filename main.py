@@ -1,73 +1,132 @@
-# made by ZeroTwo#1337 using chatgpt
-# You use it at your own risk.
 from datetime import timedelta
-import discord
-from discord import utils as Utils
+from discord import utils
 from discord.ext import commands
+from dotenv import load_dotenv
+import discord
 import requests
+import config
+import os
+import re
 
+userWarnings = {} # map of warnings for every member
 
-# config
-TOKEN = '1234' # your discord bot token
-SERVER_ID = 1234 # works only in this guild
-PERSPECTIVE_API_KEY = '1234' # your perspective api key from google
-ignored_role_id = 1234 # ignored role id
-mute_time = 60 # mute time in seconds
-toxiclevel = 0.6 # toxic level (0.1 - 0.9)
-
+load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix='.', intents=intents)
 
 
-def check_toxicity(message_content, language):
-    url = 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze?key=' + PERSPECTIVE_API_KEY
-    analyze_request = {
+@bot.event
+async def on_ready():
+    print("[Log] Bot is ready.")
+    print(f"[Log] Logged in as {bot.user}")
+
+
+async def requestMessageCheck(message_content, language):
+    url = 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze?key=' + os.getenv('PERSPECTIVE_API_KEY')
+
+    analyzeRequest = {
         'comment': {'text': message_content},
         'languages': [language],
         'requestedAttributes': {'TOXICITY': {}}
     }
+
     try:
-        response = requests.post(url, json=analyze_request)
+        response = requests.post(url, json=analyzeRequest)
         data = response.json()
-        toxicity_score = data['attributeScores']['TOXICITY']['summaryScore']['value']
-        return toxicity_score
+        toxicityScore = data['attributeScores']['TOXICITY']['summaryScore']['value']
+        return toxicityScore
+
     except requests.exceptions.RequestException as error:
-        print(f'An error occurred: {error}')
+        print(f"[Log] An error occurred: {error}")
         return 0.0
 
 
+async def discordMessageCheck(message, requestType):
 
+    whitelistedPatterns = [re.compile(pattern) for pattern in config.whitelistedWords]
+    blacklistedPatterns = [re.compile(pattern) for pattern in config.blacklistedWords]
 
-@bot.event
-async def on_ready():
-    print('Bot is ready.')
+    if any(pattern.search(message.content) for pattern in whitelistedPatterns):
+        for pattern in whitelistedPatterns:
+            messageContent = re.sub(pattern, "", message.content)
+    else:
+        messageContent = message.content
+
+    if len(messageContent) == 0:
+        messageContent += ""
+
+    toxicityScore = await requestMessageCheck(messageContent, 'en')
+
+    if any(pattern.search(message.content) for pattern in blacklistedPatterns):
+        for pattern in blacklistedPatterns:
+            if pattern.search(message.content):
+                toxicityScore += 1
+
+    if toxicityScore >= config.toxicityThreshold:
+        try:
+            userId = message.author.id
+
+            try:
+                test = userWarnings[userId]
+            except:
+                userWarnings[userId] = 0
+
+            if requestType == 1: # edited or normal message
+                msg = "message"
+            elif requestType == 2:
+                msg = "edited message"
+            else:
+                msg = "message"
+
+            if userWarnings[userId] >= 3:
+
+                await message.channel.send(
+                    f"{message.author.mention} Your {msg} was toxic or breaking rules. Warning number 4/4. You got muted!")
+                await message.delete()
+                await message.author.timeout(utils.utcnow() + timedelta(seconds=config.muteTime), reason="Toxic or breaking rules message")
+                userWarnings[userId] = 0
+            else:
+                userWarnings[userId] += 1
+                await message.channel.send(
+                    f"{message.author.mention} Your {msg} was toxic or breaking rules. Warning number {userWarnings[userId]}/4.")
+                await message.delete()
+        except:
+            print("error in except line 81")
+            pass
 
 
 @bot.event
 async def on_message(message):
-    if not message.guild.id == SERVER_ID:
+    if not message.guild.id == config.serverId:
         return
+
     if message.author.bot:
         return
 
-    if ignored_role_id in [role.id for role in message.author.roles]:
+    if config.ignoredRoleId in [role.id for role in message.author.roles]:
         return
 
-    toxicity_threshold = toxiclevel
-    toxicity_score_en = check_toxicity(message.content, 'en')
-    toxicity_score_pl = check_toxicity(message.content, 'pl')
-    toxicity_score_de = check_toxicity(message.content, 'de')
-    if toxicity_score_en >= toxicity_threshold or toxicity_score_pl >= toxicity_threshold or toxicity_score_de >= toxicity_threshold:
-        try:
-            await message.channel.send(f"{message.author.mention} Your message was toxic.")
-            await message.delete()
-            await message.author.timeout(Utils.utcnow()+timedelta(seconds=mute_time), reason="toxic message")
-
-        except:
-            pass
-
+    await discordMessageCheck(message, 1)
     await bot.process_commands(message)
 
-bot.run(TOKEN)
+
+@bot.event
+async def on_message_edit(before, after):
+    message = after
+
+    if not message.guild.id == config.serverId:
+        return
+
+    if message.author.bot:
+        return
+
+    if config.ignoredRoleId in [role.id for role in message.author.roles]:
+        return
+
+    await discordMessageCheck(message, 2)
+    await bot.process_commands(message)
+
+
+bot.run(os.getenv('TOKEN'))
